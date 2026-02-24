@@ -21,6 +21,7 @@ async function NewChatPage() {
   if (!modelIdFromCookie) {
     return (
       <>
+        <div className="border-b px-4 py-2 text-center text-sm text-zinc-600">Csimborasszó asszisztens (teszt)</div>
         <Chat
           autoResume={false}
           id={id}
@@ -37,6 +38,7 @@ async function NewChatPage() {
 
   return (
     <>
+      <div className="border-b px-4 py-2 text-center text-sm text-zinc-600">Csimborasszó asszisztens (teszt)</div>
       <Chat
         autoResume={false}
         id={id}

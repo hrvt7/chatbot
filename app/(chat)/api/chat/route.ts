@@ -17,6 +17,8 @@ import { createDocument } from "@/lib/ai/tools/create-document";
 import { getWeather } from "@/lib/ai/tools/get-weather";
 import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
 import { updateDocument } from "@/lib/ai/tools/update-document";
+import { emergencyText, hasEmergencyRedFlag } from "@/lib/safety";
+import { suggestSpecialtiesFromText } from "@/lib/triage";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
   createStreamId,
@@ -135,13 +137,30 @@ export async function POST(request: Request) {
       selectedChatModel.includes("thinking");
 
     const modelMessages = await convertToModelMessages(uiMessages);
+    const latestUserText =
+      message?.role === "user"
+        ? message.parts
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join(" ")
+        : "";
+
+    const triageSuggestions = latestUserText
+      ? suggestSpecialtiesFromText(latestUserText)
+      : [];
+
+    const runtimeSafetyPrompt = hasEmergencyRedFlag(latestUserText)
+      ? `Kiemelt biztonsági jelzés: piros zászló szerepelhet a felhasználó üzenetében. Válaszod elején jelenjen meg pontosan ez a mondat: "${emergencyText}". Csak sürgős ellátás + elérhetőség/időpont CTA.`
+      : triageSuggestions.length > 0
+        ? `Lehetséges szakterület(ek) a kulcsszavak alapján: ${triageSuggestions.join(", ")}.`
+        : "";
 
     const stream = createUIMessageStream({
       originalMessages: isToolApprovalFlow ? uiMessages : undefined,
       execute: async ({ writer: dataStream }) => {
         const result = streamText({
           model: getLanguageModel(selectedChatModel),
-          system: systemPrompt({ selectedChatModel, requestHints }),
+          system: `${systemPrompt({ selectedChatModel, requestHints })}\n\n${runtimeSafetyPrompt}`,
           messages: modelMessages,
           stopWhen: stepCountIs(5),
           experimental_activeTools: isReasoningModel
