@@ -3,7 +3,7 @@
 import type { UseChatHelpers } from "@ai-sdk/react";
 import type { UIMessage } from "ai";
 import equal from "fast-deep-equal";
-import { CheckIcon } from "lucide-react";
+import { CheckIcon, CopyIcon, PhoneCallIcon } from "lucide-react";
 import {
   type ChangeEvent,
   type Dispatch,
@@ -143,6 +143,14 @@ function PureMultimodalInput({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadQueue, setUploadQueue] = useState<string[]>([]);
+  const [isLeadModalOpen, setIsLeadModalOpen] = useState(false);
+  const [leadForm, setLeadForm] = useState({
+    name: "",
+    phone: "",
+    email: "",
+    preferredTime: "",
+    message: "",
+  });
 
   const submitForm = useCallback(() => {
     window.history.pushState({}, "", `/chat/${chatId}`);
@@ -206,7 +214,7 @@ function PureMultimodalInput({
       const { error } = await response.json();
       toast.error(error);
     } catch (_error) {
-      toast.error("Failed to upload file, please try again!");
+      toast.error("Feltöltési hiba, próbálja újra!");
     }
   }, []);
 
@@ -276,13 +284,49 @@ function PureMultimodalInput({
         ]);
       } catch (error) {
         console.error("Error uploading pasted images:", error);
-        toast.error("Failed to upload pasted image(s)");
+        toast.error("A beillesztett kép feltöltése nem sikerült");
       } finally {
         setUploadQueue([]);
       }
     },
     [setAttachments, uploadFile]
   );
+
+
+  const copySummary = useCallback(async () => {
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((item) => item.role === "assistant");
+
+    const textPart = lastAssistant?.parts?.find((part) => part.type === "text");
+    const summary = `Összefoglaló
+Utolsó asszisztens válasz:
+${textPart && "text" in textPart ? textPart.text : "-"}
+
+Név: ${leadForm.name || "-"}
+Telefon: ${leadForm.phone || "-"}
+Preferált idő: ${leadForm.preferredTime || "-"}`;
+
+    await navigator.clipboard.writeText(summary);
+    toast.success("Összefoglaló a vágólapra másolva.");
+  }, [leadForm, messages]);
+
+  const submitLead = useCallback(async () => {
+    const response = await fetch("/api/leads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(leadForm),
+    });
+
+    if (!response.ok) {
+      toast.error("A visszahívási kérés mentése sikertelen.");
+      return;
+    }
+
+    toast.success("Köszönjük! Hamarosan visszahívjuk.");
+    setIsLeadModalOpen(false);
+    setLeadForm({ name: "", phone: "", email: "", preferredTime: "", message: "" });
+  }, [leadForm]);
 
   // Add paste event listener to textarea
   useEffect(() => {
@@ -316,6 +360,35 @@ function PureMultimodalInput({
         type="file"
       />
 
+
+      <div className="mb-2 flex flex-wrap gap-2">
+        <Button onClick={() => setIsLeadModalOpen(true)} type="button" variant="outline">
+          <PhoneCallIcon className="mr-1 size-4" />
+          Visszahívást kérek
+        </Button>
+        <Button onClick={copySummary} type="button" variant="outline">
+          <CopyIcon className="mr-1 size-4" />
+          Összefoglaló másolása
+        </Button>
+      </div>
+
+      {isLeadModalOpen ? (
+        <div className="mb-3 rounded-lg border p-3">
+          <p className="mb-2 font-medium">Visszahívást kérek</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <input className="rounded border px-2 py-1" onChange={(event) => setLeadForm((prev) => ({ ...prev, name: event.target.value }))} placeholder="Név*" value={leadForm.name} />
+            <input className="rounded border px-2 py-1" onChange={(event) => setLeadForm((prev) => ({ ...prev, phone: event.target.value }))} placeholder="Telefon*" value={leadForm.phone} />
+            <input className="rounded border px-2 py-1" onChange={(event) => setLeadForm((prev) => ({ ...prev, email: event.target.value }))} placeholder="E-mail (opcionális)" value={leadForm.email} />
+            <input className="rounded border px-2 py-1" onChange={(event) => setLeadForm((prev) => ({ ...prev, preferredTime: event.target.value }))} placeholder="Mikor hívjuk?" value={leadForm.preferredTime} />
+          </div>
+          <textarea className="mt-2 w-full rounded border px-2 py-1" onChange={(event) => setLeadForm((prev) => ({ ...prev, message: event.target.value }))} placeholder="Rövid üzenet*" rows={3} value={leadForm.message} />
+          <div className="mt-2 flex gap-2">
+            <Button onClick={submitLead} type="button">Küldés</Button>
+            <Button onClick={() => setIsLeadModalOpen(false)} type="button" variant="ghost">Mégse</Button>
+          </div>
+        </div>
+      ) : null}
+
       <PromptInput
         className="rounded-xl border border-border bg-background p-3 shadow-xs transition-all duration-200 focus-within:border-border hover:border-muted-foreground/50"
         onSubmit={(event) => {
@@ -324,7 +397,7 @@ function PureMultimodalInput({
             return;
           }
           if (status !== "ready") {
-            toast.error("Please wait for the model to finish its response!");
+            toast.error("Kérem várjon, amíg a válasz elkészül!");
           } else {
             submitForm();
           }
@@ -371,7 +444,7 @@ function PureMultimodalInput({
             maxHeight={200}
             minHeight={44}
             onChange={handleInput}
-            placeholder="Send a message..."
+            placeholder="Írja be kérdését..."
             ref={textareaRef}
             rows={1}
             value={input}
@@ -494,7 +567,7 @@ function PureModelSelectorCompact({
         </Button>
       </ModelSelectorTrigger>
       <ModelSelectorContent>
-        <ModelSelectorInput placeholder="Search models..." />
+        <ModelSelectorInput placeholder="Modellek keresése..." />
         <ModelSelectorList>
           {Object.entries(modelsByProvider).map(
             ([providerKey, providerModels]) => (

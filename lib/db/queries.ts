@@ -12,11 +12,10 @@ import {
   lt,
   type SQL,
 } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
 import type { ArtifactKind } from "@/components/artifact";
 import type { VisibilityType } from "@/components/visibility-selector";
 import { ChatbotError } from "../errors";
+import { db } from "./index";
 import { generateUUID } from "../utils";
 import {
   type Chat,
@@ -25,6 +24,7 @@ import {
   document,
   message,
   type Suggestion,
+  lead,
   stream,
   suggestion,
   type User,
@@ -36,10 +36,6 @@ import { generateHashedPassword } from "./utils";
 // Optionally, if not using email/pass login, you can
 // use the Drizzle adapter for Auth.js / NextAuth
 // https://authjs.dev/reference/adapter/drizzle
-
-// biome-ignore lint: Forbidden non-null assertion.
-const client = postgres(process.env.POSTGRES_URL!);
-const db = drizzle(client);
 
 export async function getUser(email: string): Promise<User[]> {
   try {
@@ -598,5 +594,38 @@ export async function getStreamIdsByChatId({ chatId }: { chatId: string }) {
       "bad_request:database",
       "Failed to get stream ids by chat id"
     );
+  }
+}
+
+export async function createLead({
+  name,
+  phone,
+  email,
+  preferredTime,
+  message,
+}: {
+  name: string;
+  phone: string;
+  email?: string;
+  preferredTime?: string;
+  message: string;
+}) {
+  try {
+    const [createdLead] = await db
+      .insert(lead)
+      .values({ name, phone, email, preferredTime, message })
+      .returning();
+
+    return createdLead;
+  } catch (_error) {
+    throw new ChatbotError("bad_request:database", "Failed to create lead");
+  }
+}
+
+export async function getLeads() {
+  try {
+    return await db.select().from(lead).orderBy(desc(lead.createdAt));
+  } catch (_error) {
+    throw new ChatbotError("bad_request:database", "Failed to get leads");
   }
 }
