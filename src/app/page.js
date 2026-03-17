@@ -2,6 +2,18 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 
+/* ─── MOBILE HOOK ─────────────────────────────────────── */
+function useIsMobile() {
+  const [mobile, setMobile] = useState(false);
+  useEffect(() => {
+    const check = () => setMobile(window.innerWidth < 768);
+    check();
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, []);
+  return mobile;
+}
+
 /* ═══════════════════════════════════════════════════════════
    Z Ö L D R A D A R  ·  HOLOGRAPHIC 3D MAP — LIVE DATA
    ═══════════════════════════════════════════════════════════ */
@@ -82,14 +94,14 @@ const scC = s => s>=70?"#00ffaa":s>=55?"#facc15":"#fb923c";
 const evColor = kw => kw>=50?"#00ffaa":kw>=22?"#60a5fa":"#fb923c";
 
 /* ─── 3D SCENE ──────────────────────────────────────────── */
-function HoloMap({ onSelect, tab, airStations, chargers }) {
+function HoloMap({ onSelect, tab, airStations, chargers, isMobile }) {
   const mountRef = useRef(null);
   const sceneRef = useRef({ scene: null, markersGroup: null, camera: null, clickables: [], chargerPoints: null });
-  const dataRef = useRef({ tab, airStations, chargers, onSelect });
+  const dataRef = useRef({ tab, airStations, chargers, onSelect, isMobile });
 
   useEffect(() => {
-    dataRef.current = { tab, airStations, chargers, onSelect };
-  }, [tab, airStations, chargers, onSelect]);
+    dataRef.current = { tab, airStations, chargers, onSelect, isMobile };
+  }, [tab, airStations, chargers, onSelect, isMobile]);
 
   // Build markers when tab or data changes
   const rebuildMarkers = useCallback(() => {
@@ -173,9 +185,10 @@ function HoloMap({ onSelect, tab, airStations, chargers }) {
       sceneRef.current.chargerPoints = { cloud: pointCloud, data: points };
 
       // Also add clickable invisible spheres at each charger for raycasting
+      const hitRadius = dataRef.current.isMobile ? 0.07 : 0.04;
       points.forEach((c, i) => {
         const p = project(c.lat, c.lng);
-        const hitGeo = new THREE.SphereGeometry(0.04, 6, 6);
+        const hitGeo = new THREE.SphereGeometry(hitRadius, 6, 6);
         const hitMat = new THREE.MeshBasicMaterial({ visible: false });
         const hit = new THREE.Mesh(hitGeo, hitMat);
         hit.position.set(p.x, 0.03, p.z);
@@ -228,22 +241,26 @@ function HoloMap({ onSelect, tab, airStations, chargers }) {
     const scene = new THREE.Scene();
     scene.fog = new THREE.FogExp2(0x020608, 0.06);
 
+    const mob = dataRef.current.isMobile;
+    const initZoom = mob ? 4.0 : 3.5;
     const camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 100);
-    camera.position.set(0, 3.5, 3.5);
+    camera.position.set(0, initZoom, initZoom);
     camera.lookAt(0, 0, 0);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(W, H);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, mob ? 1.5 : 2));
     renderer.setClearColor(0x020608, 1);
     mount.appendChild(renderer.domElement);
 
-    // Ground grid
+    // Ground grid (skip on mobile for performance)
     const gridGroup = new THREE.Group();
-    const gridMat = new THREE.LineBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.04 });
-    for (let i = -5; i <= 5; i += 0.5) {
-      gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(i, -0.01, -5), new THREE.Vector3(i, -0.01, 5)]), gridMat));
-      gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-5, -0.01, i), new THREE.Vector3(5, -0.01, i)]), gridMat));
+    if (!mob) {
+      const gridMat = new THREE.LineBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.04 });
+      for (let i = -5; i <= 5; i += 0.5) {
+        gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(i, -0.01, -5), new THREE.Vector3(i, -0.01, 5)]), gridMat));
+        gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-5, -0.01, i), new THREE.Vector3(5, -0.01, i)]), gridMat));
+      }
     }
     scene.add(gridGroup);
 
@@ -277,7 +294,7 @@ function HoloMap({ onSelect, tab, airStations, chargers }) {
     rebuildMarkers();
 
     // Particles
-    const pCount = 800;
+    const pCount = mob ? 300 : 800;
     const pGeo = new THREE.BufferGeometry();
     const pPos = new Float32Array(pCount * 3);
     const pVel = [];
@@ -305,10 +322,10 @@ function HoloMap({ onSelect, tab, airStations, chargers }) {
 
     // Interaction
     const raycaster = new THREE.Raycaster();
-    raycaster.params.Points = { threshold: 0.05 };
+    raycaster.params.Points = { threshold: mob ? 0.1 : 0.05 };
     const pointer = new THREE.Vector2(-10, -10);
     let targetRotY = 0, rotY = 0, targetRotX = 0.7, rotX = 0.7;
-    let targetZoom = 3.5, zoom = 3.5;
+    let targetZoom = initZoom, zoom = initZoom;
     let isDragging = false, dragX = 0, dragY = 0, dragRotY = 0, dragRotX = 0;
 
     const onMove = (e) => {
@@ -333,11 +350,64 @@ function HoloMap({ onSelect, tab, airStations, chargers }) {
       }
     };
 
+    // Touch handlers
+    let lastTouchDist = 0;
+    const onTouchStart = (e) => {
+      if (e.touches.length === 1) {
+        const t = e.touches[0];
+        isDragging = true; dragX = t.clientX; dragY = t.clientY; dragRotY = targetRotY; dragRotX = targetRotX;
+      } else if (e.touches.length === 2) {
+        const dx = e.touches[0].clientX - e.touches[1].clientX;
+        const dy = e.touches[0].clientY - e.touches[1].clientY;
+        lastTouchDist = Math.sqrt(dx * dx + dy * dy);
+      }
+    };
+    const onTouchMove = (e) => {
+      e.preventDefault();
+      if (e.touches.length === 1 && isDragging) {
+        const t = e.touches[0];
+        targetRotY = dragRotY + (t.clientX - dragX) * 0.008;
+        targetRotX = dragRotX + (t.clientY - dragY) * 0.005;
+        targetRotX = Math.max(0.2, Math.min(1.4, targetRotX));
+        const rect = mount.getBoundingClientRect();
+        pointer.x = ((t.clientX - rect.left) / rect.width) * 2 - 1;
+        pointer.y = -((t.clientY - rect.top) / rect.height) * 2 + 1;
+      } else if (e.touches.length === 2) {
+        const dx = e.touches[0].clientX - e.touches[1].clientX;
+        const dy = e.touches[0].clientY - e.touches[1].clientY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (lastTouchDist > 0) {
+          targetZoom += (lastTouchDist - dist) * 0.015;
+          targetZoom = Math.max(1.8, Math.min(6, targetZoom));
+        }
+        lastTouchDist = dist;
+      }
+    };
+    const onTouchEnd = (e) => {
+      isDragging = false;
+      lastTouchDist = 0;
+      if (e.changedTouches.length === 1) {
+        const t = e.changedTouches[0];
+        const rect = mount.getBoundingClientRect();
+        pointer.x = ((t.clientX - rect.left) / rect.width) * 2 - 1;
+        pointer.y = -((t.clientY - rect.top) / rect.height) * 2 + 1;
+        raycaster.setFromCamera(pointer, camera);
+        const hits = raycaster.intersectObjects(sceneRef.current.clickables);
+        if (hits.length > 0) {
+          const ud = hits[0].object.userData;
+          dataRef.current.onSelect({ ...ud.data, _type: ud.type });
+        }
+      }
+    };
+
     mount.addEventListener("mousemove", onMove);
     mount.addEventListener("mousedown", onDown);
     window.addEventListener("mouseup", onUp);
     mount.addEventListener("wheel", onWheel, { passive: false });
     mount.addEventListener("click", onClick);
+    mount.addEventListener("touchstart", onTouchStart, { passive: false });
+    mount.addEventListener("touchmove", onTouchMove, { passive: false });
+    mount.addEventListener("touchend", onTouchEnd);
 
     // Animate
     let t = 0;
@@ -405,6 +475,9 @@ function HoloMap({ onSelect, tab, airStations, chargers }) {
       mount.removeEventListener("mousedown", onDown);
       window.removeEventListener("mouseup", onUp);
       mount.removeEventListener("click", onClick);
+      mount.removeEventListener("touchstart", onTouchStart);
+      mount.removeEventListener("touchmove", onTouchMove);
+      mount.removeEventListener("touchend", onTouchEnd);
       window.removeEventListener("resize", onResize);
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
       renderer.dispose();
@@ -445,6 +518,7 @@ export default function ZoldRadarHolo() {
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
   const [isDemo, setIsDemo] = useState(false);
+  const isMobile = useIsMobile();
 
   useEffect(() => { setTimeout(() => setReady(true), 400); }, []);
 
@@ -481,39 +555,45 @@ export default function ZoldRadarHolo() {
       <style>{`
         @keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
         @keyframes slideIn{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:none}}
+        @keyframes slideUp{from{opacity:0;transform:translateY(100%)}to{opacity:1;transform:none}}
         @keyframes pulse{0%,100%{opacity:.3}50%{opacity:.9}}
         @keyframes shimmer{0%{opacity:.15}50%{opacity:.4}100%{opacity:.15}}
         *{box-sizing:border-box;margin:0;padding:0}
         ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:rgba(0,255,170,.12);border-radius:3px}
       `}</style>
 
-      <HoloMap onSelect={setSelected} tab={tab} airStations={airStations} chargers={chargers} />
+      <HoloMap onSelect={setSelected} tab={tab} airStations={airStations} chargers={chargers} isMobile={isMobile} />
 
       {/* ─── TOP BAR ─── */}
       <div style={{
         position: "absolute", top: 0, left: 0, right: 0, zIndex: 10,
-        padding: "16px 28px", display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: isMobile ? "10px 12px" : "16px 28px",
+        display: "flex", alignItems: isMobile ? "flex-start" : "center", justifyContent: "space-between",
+        flexWrap: isMobile ? "wrap" : "nowrap", gap: isMobile ? 8 : 0,
         background: "linear-gradient(180deg, rgba(2,6,8,.85) 0%, transparent 100%)",
         animation: ready ? "fadeUp .8s cubic-bezier(.16,1,.3,1) both" : "none",
       }}>
-        <div style={{ maxWidth: 420 }}>
-          <div style={{ fontSize: 10, color: "#00ffaa", letterSpacing: ".2em", textTransform: "uppercase", fontWeight: 600, marginBottom: 6 }}>
+        <div style={{ maxWidth: isMobile ? "100%" : 420, flex: isMobile ? "1 1 auto" : undefined }}>
+          <div style={{ fontSize: isMobile ? 8 : 10, color: "#00ffaa", letterSpacing: ".2em", textTransform: "uppercase", fontWeight: 600, marginBottom: isMobile ? 2 : 6 }}>
             Magyarország · Környezeti Intelligencia
           </div>
-          <h1 style={{ fontSize: 32, fontWeight: 800, color: "#f0fdf4", letterSpacing: "-.04em", lineHeight: 1.05, textShadow: "0 0 60px rgba(0,255,170,.12)" }}>
+          <h1 style={{ fontSize: isMobile ? 18 : 32, fontWeight: 800, color: "#f0fdf4", letterSpacing: "-.04em", lineHeight: 1.05, textShadow: "0 0 60px rgba(0,255,170,.12)" }}>
             A zöld átmenet <span style={{ color: "#00ffaa" }}>élő hologramja</span>
           </h1>
-          <p style={{ fontSize: 12, color: "rgba(255,255,255,.3)", marginTop: 6, lineHeight: 1.6, fontWeight: 300 }}>
-            Forgasd a 3D térképet · Görgess a zoomhoz · Kattints a {tab === "air" ? "mérőállomásokra" : tab === "ev" ? "töltőkre" : "városokra"}
-          </p>
+          {!isMobile && (
+            <p style={{ fontSize: 12, color: "rgba(255,255,255,.3)", marginTop: 6, lineHeight: 1.6, fontWeight: 300 }}>
+              Forgasd a 3D térképet · Görgess a zoomhoz · Kattints a {tab === "air" ? "mérőállomásokra" : tab === "ev" ? "töltőkre" : "városokra"}
+            </p>
+          )}
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: isMobile ? 8 : 16, ...(isMobile ? { width: "100%", justifyContent: "space-between" } : {}) }}>
           <div style={{ display: "flex", gap: 0, background: "rgba(255,255,255,.02)", borderRadius: 10, padding: 3, border: "1px solid rgba(255,255,255,.03)" }}>
             {[{ id: "air", l: "Levegő", e: "🌬" }, { id: "energy", l: "Energia", e: "☀️" }, { id: "ev", l: "Töltők", e: "⚡" }].map(t => (
               <button key={t.id} onClick={() => { setTab(t.id); setSelected(null); }} style={{
-                padding: "6px 16px", border: "none", borderRadius: 8, cursor: "pointer", fontFamily: font,
-                fontSize: 11, fontWeight: 500, display: "flex", alignItems: "center", gap: 5,
+                padding: isMobile ? "4px 10px" : "6px 16px", border: "none", borderRadius: 8, cursor: "pointer", fontFamily: font,
+                fontSize: isMobile ? 10 : 11, fontWeight: 500, display: "flex", alignItems: "center", gap: 5,
+                minHeight: isMobile ? 44 : undefined,
                 background: tab === t.id ? "rgba(0,255,170,.08)" : "transparent",
                 color: tab === t.id ? "#00ffaa" : "rgba(255,255,255,.22)",
                 transition: "all .3s",
@@ -531,10 +611,10 @@ export default function ZoldRadarHolo() {
 
       {/* ─── BOTTOM LEFT: STATS ─── */}
       <div style={{
-        position: "absolute", bottom: 28, left: 28, zIndex: 10,
+        position: "absolute", bottom: isMobile ? 16 : 28, left: isMobile ? 16 : 28, zIndex: 10,
         animation: ready ? "fadeUp 1s cubic-bezier(.16,1,.3,1) .3s both" : "none",
       }}>
-        <div style={{ display: "flex", gap: 24 }}>
+        <div style={{ display: isMobile ? "grid" : "flex", gridTemplateColumns: "1fr 1fr", gap: isMobile ? "8px 20px" : 24 }}>
           {[
             { l: "AQI Átlag", v: loading ? "---" : String(stats?.avgAqi ?? "46"), c: "#facc15" },
             { l: "Napenergia", v: "3.9 GW", c: "#00ffaa" },
@@ -543,24 +623,38 @@ export default function ZoldRadarHolo() {
           ].map((s, i) => (
             <div key={i}>
               <div style={{ fontSize: 8, color: "rgba(255,255,255,.22)", textTransform: "uppercase", letterSpacing: ".12em", fontWeight: 500 }}>{s.l}</div>
-              <div style={{ fontSize: 24, fontWeight: 800, color: s.c, fontFamily: mono, letterSpacing: "-.04em", marginTop: 3, textShadow: `0 0 20px ${s.c}35`, animation: loading ? "shimmer 1.5s infinite" : "none" }}>{s.v}</div>
+              <div style={{ fontSize: isMobile ? 18 : 24, fontWeight: 800, color: s.c, fontFamily: mono, letterSpacing: "-.04em", marginTop: 3, textShadow: `0 0 20px ${s.c}35`, animation: loading ? "shimmer 1.5s infinite" : "none" }}>{s.v}</div>
             </div>
           ))}
         </div>
         {isDemo && <div style={{ fontSize: 8, color: "rgba(251,146,40,.5)", marginTop: 6, fontStyle: "italic" }}>(demo adat)</div>}
       </div>
 
-      {/* ─── RIGHT: DETAIL PANEL ─── */}
+      {/* ─── DETAIL PANEL ─── */}
       {d && (
-        <div style={{
+        <div style={isMobile ? {
+          position: "fixed", bottom: 0, left: 0, right: 0, maxHeight: "60vh", zIndex: 20,
+          animation: "slideUp .4s cubic-bezier(.16,1,.3,1) both",
+          display: "flex", flexDirection: "column", gap: 8, overflowY: "auto",
+          background: "rgba(2,6,8,.92)", backdropFilter: "blur(24px)",
+          borderRadius: "16px 16px 0 0", padding: "8px 16px 24px",
+          border: "1px solid rgba(255,255,255,.06)", borderBottom: "none",
+        } : {
           position: "absolute", top: 70, right: 24, bottom: 24, width: 330, zIndex: 10,
           animation: "slideIn .6s cubic-bezier(.16,1,.3,1) both",
           display: "flex", flexDirection: "column", gap: 8, overflowY: "auto",
         }}>
+          {/* Mobile drag handle */}
+          {isMobile && (
+            <div style={{ display: "flex", justifyContent: "center", padding: "4px 0 8px" }}>
+              <div style={{ width: 36, height: 4, borderRadius: 2, background: "rgba(255,255,255,.15)" }} />
+            </div>
+          )}
           <button onClick={() => setSelected(null)} style={{
             alignSelf: "flex-end", background: "rgba(255,255,255,.04)", border: "1px solid rgba(255,255,255,.06)",
-            borderRadius: 8, width: 30, height: 30, cursor: "pointer", color: "rgba(255,255,255,.25)",
-            fontSize: 13, display: "grid", placeItems: "center", backdropFilter: "blur(16px)",
+            borderRadius: 8, width: isMobile ? 40 : 30, height: isMobile ? 40 : 30, cursor: "pointer", color: "rgba(255,255,255,.25)",
+            fontSize: isMobile ? 16 : 13, display: "grid", placeItems: "center", backdropFilter: "blur(16px)",
+            minWidth: 44, minHeight: 44,
           }}>✕</button>
 
           {/* Air station panel */}
@@ -685,7 +779,7 @@ export default function ZoldRadarHolo() {
       )}
 
       {/* Instruction */}
-      {!selected && (
+      {!selected && !isMobile && (
         <div style={{
           position: "absolute", bottom: 24, right: 28, zIndex: 10,
           animation: ready ? "fadeUp 1s cubic-bezier(.16,1,.3,1) 1s both" : "none",
