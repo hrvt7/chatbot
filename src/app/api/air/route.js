@@ -1,6 +1,11 @@
 // /api/air - Fetches real-time air quality data for Hungary from WAQI
 // Bounding box: Hungary approx 45.7-48.6 lat, 16.1-22.9 lng
 
+const NON_HU_KEYWORDS = [
+  'Austria', 'Slovakia', 'Romania', 'Serbia', 'Croatia', 'Slovenia', 'Ukraine',
+  'Österreich', 'Slovensko', 'Hrvatska', 'Srbija', 'Románia', 'Slovenija',
+];
+
 export async function GET() {
   const token = process.env.WAQI_TOKEN;
 
@@ -18,19 +23,25 @@ export async function GET() {
       return Response.json({ error: "WAQI API error", details: data }, { status: 502 });
     }
 
-    // Transform to clean format
-    const stations = data.data.map((s) => ({
-      name: s.station.name,
-      lat: s.lat,
-      lng: s.lon,
-      aqi: parseInt(s.aqi) || null,
-    })).filter(s => s.aqi !== null && s.aqi > 0);
+    // Transform + filter: remove foreign stations by name and strict bounding box
+    const stations = data.data
+      .map((s) => ({
+        name: s.station.name,
+        lat: s.lat,
+        lng: s.lon,
+        aqi: parseInt(s.aqi) || null,
+      }))
+      .filter(s => s.aqi !== null && s.aqi > 0)
+      .filter(s => !NON_HU_KEYWORDS.some(kw => s.name.toLowerCase().includes(kw.toLowerCase())))
+      .filter(s => s.lat >= 45.74 && s.lat <= 48.59 && s.lng >= 16.11 && s.lng <= 22.90);
 
     return Response.json({
       stations,
       count: stations.length,
       timestamp: new Date().toISOString(),
-      avgAqi: Math.round(stations.reduce((sum, s) => sum + s.aqi, 0) / stations.length),
+      avgAqi: stations.length > 0
+        ? Math.round(stations.reduce((sum, s) => sum + s.aqi, 0) / stations.length)
+        : 0,
     });
   } catch (err) {
     return Response.json({ error: "Failed to fetch air quality data", message: err.message }, { status: 500 });
