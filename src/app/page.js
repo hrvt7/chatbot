@@ -1,11 +1,12 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 
 /* ═══════════════════════════════════════════════════════════
-   Z Ö L D R A D A R  ·  HOLOGRAPHIC 3D MAP
+   Z Ö L D R A D A R  ·  HOLOGRAPHIC 3D MAP — LIVE DATA
    ═══════════════════════════════════════════════════════════ */
 
+// Fallback hardcoded data
 const CITIES = [
   { name:"Budapest",       county:"Budapest",       lat:47.50, lng:19.04, aqi:72, ev:48, sol:120, co2:5.2, sc:58 },
   { name:"Székesfehérvár", county:"Fejér",           lat:47.19, lng:18.42, aqi:42, ev:12, sol:310, co2:6.1, sc:62 },
@@ -28,14 +29,11 @@ const CITIES = [
   { name:"Kecskemét",      county:"Bács-Kiskun",     lat:46.90, lng:19.69, aqi:41, ev:6,  sol:290, co2:4.1, sc:67 },
 ];
 
-// Project lat/lng to flat 3D coords (centered on Hungary)
 function project(lat, lng) {
   const cx = 19.5, cy = 47.2, scale = 0.55;
   return { x: (lng - cx) * scale, z: -(lat - cy) * scale };
 }
 
-// Hungary border outline
-// Real Hungary border from world-geojson (Natural Earth) - 1084pts simplified to 156
 const HU_BORDER = [
   [48.58512,21.44033],[48.55911,21.41544],[48.56036,21.36497],[48.56207,21.32206],
   [48.55321,21.31708],[48.54377,21.31657],[48.53320,21.31622],[48.52661,21.30730],
@@ -78,16 +76,150 @@ const HU_BORDER = [
   [48.55218,21.50745],[48.55866,21.48960],[48.57377,21.46076],[48.58512,21.44033],
 ];
 
-const aqiC = v => v<=30?"#00ffaa":v<=45?"#4ade80":v<=55?"#facc15":v<=65?"#fb923c":"#ef4444";
+const aqiColor = v => v<=30?"#00ffaa":v<=50?"#4ade80":v<=100?"#facc15":v<=150?"#fb923c":"#ef4444";
+const aqiLabel = v => v<=30?"Kiváló":v<=50?"Jó":v<=100?"Mérsékelt":v<=150?"Egészségtelen":"Veszélyes";
 const scC = s => s>=70?"#00ffaa":s>=55?"#facc15":"#fb923c";
+const evColor = kw => kw>=50?"#00ffaa":kw>=22?"#60a5fa":"#fb923c";
 
 /* ─── 3D SCENE ──────────────────────────────────────────── */
-function HoloMap({ onSelect, selected, dataMode }) {
+function HoloMap({ onSelect, tab, airStations, chargers }) {
   const mountRef = useRef(null);
-  const stateRef = useRef({ selected, dataMode });
+  const sceneRef = useRef({ scene: null, markersGroup: null, camera: null, clickables: [], chargerPoints: null });
+  const dataRef = useRef({ tab, airStations, chargers, onSelect });
 
-  useEffect(() => { stateRef.current = { selected, dataMode }; }, [selected, dataMode]);
+  useEffect(() => {
+    dataRef.current = { tab, airStations, chargers, onSelect };
+  }, [tab, airStations, chargers, onSelect]);
 
+  // Build markers when tab or data changes
+  const rebuildMarkers = useCallback(() => {
+    const { markersGroup } = sceneRef.current;
+    const { tab: t, airStations: air, chargers: evs } = dataRef.current;
+    if (!markersGroup) return;
+
+    // Clear old markers
+    while (markersGroup.children.length) {
+      const child = markersGroup.children[0];
+      if (child.geometry) child.geometry.dispose();
+      if (child.material) child.material.dispose();
+      markersGroup.remove(child);
+    }
+    sceneRef.current.clickables = [];
+    sceneRef.current.chargerPoints = null;
+
+    if (t === "air") {
+      const stations = air.length > 0 ? air : CITIES.map(c => ({ name: c.name, lat: c.lat, lng: c.lng, aqi: c.aqi }));
+      stations.forEach((s, i) => {
+        const p = project(s.lat, s.lng);
+        const col = new THREE.Color(aqiColor(s.aqi));
+        const beamH = 0.05 + Math.min(s.aqi, 200) / 200 * 0.7;
+
+        // Beam
+        const beamGeo = new THREE.CylinderGeometry(0.01, 0.01, beamH, 8);
+        const beamMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.45 });
+        const beam = new THREE.Mesh(beamGeo, beamMat);
+        beam.position.set(p.x, beamH / 2 + 0.01, p.z);
+        markersGroup.add(beam);
+
+        // Cap sphere
+        const capGeo = new THREE.SphereGeometry(0.025, 12, 12);
+        const capMat = new THREE.MeshBasicMaterial({ color: col });
+        const cap = new THREE.Mesh(capGeo, capMat);
+        cap.position.set(p.x, beamH + 0.02, p.z);
+        cap.userData = { type: "air", index: i, data: s };
+        markersGroup.add(cap);
+        sceneRef.current.clickables.push(cap);
+
+        // Base ring
+        const ringGeo = new THREE.RingGeometry(0.03, 0.042, 24);
+        const ringMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.25, side: THREE.DoubleSide });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.rotation.x = -Math.PI / 2;
+        ring.position.set(p.x, 0.012, p.z);
+        markersGroup.add(ring);
+      });
+    } else if (t === "ev") {
+      const points = evs.length > 0 ? evs : [];
+      if (points.length === 0) return;
+
+      const positions = new Float32Array(points.length * 3);
+      const colors = new Float32Array(points.length * 3);
+      const sizes = new Float32Array(points.length);
+
+      points.forEach((c, i) => {
+        const p = project(c.lat, c.lng);
+        positions[i * 3] = p.x;
+        positions[i * 3 + 1] = 0.03 + Math.random() * 0.02;
+        positions[i * 3 + 2] = p.z;
+
+        const col = new THREE.Color(evColor(c.powerKW || 0));
+        colors[i * 3] = col.r;
+        colors[i * 3 + 1] = col.g;
+        colors[i * 3 + 2] = col.b;
+
+        sizes[i] = 0.02 + Math.min((c.numPoints || 1), 10) * 0.004;
+      });
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      const mat = new THREE.PointsMaterial({
+        size: 0.035, vertexColors: true, transparent: true, opacity: 0.8,
+        blending: THREE.AdditiveBlending, sizeAttenuation: true
+      });
+      const pointCloud = new THREE.Points(geo, mat);
+      pointCloud.userData = { type: "evCloud", chargers: points };
+      markersGroup.add(pointCloud);
+      sceneRef.current.chargerPoints = { cloud: pointCloud, data: points };
+
+      // Also add clickable invisible spheres at each charger for raycasting
+      points.forEach((c, i) => {
+        const p = project(c.lat, c.lng);
+        const hitGeo = new THREE.SphereGeometry(0.04, 6, 6);
+        const hitMat = new THREE.MeshBasicMaterial({ visible: false });
+        const hit = new THREE.Mesh(hitGeo, hitMat);
+        hit.position.set(p.x, 0.03, p.z);
+        hit.userData = { type: "ev", index: i, data: c };
+        markersGroup.add(hit);
+        sceneRef.current.clickables.push(hit);
+      });
+    } else if (t === "energy") {
+      CITIES.forEach((city, i) => {
+        const p = project(city.lat, city.lng);
+        const solNorm = Math.min(city.sol, 500) / 500;
+        const col = new THREE.Color(solNorm >= 0.6 ? "#00ffaa" : solNorm >= 0.3 ? "#facc15" : "#fb923c");
+        const beamH = 0.1 + solNorm * 0.6;
+
+        const beamGeo = new THREE.CylinderGeometry(0.012, 0.012, beamH, 8);
+        const beamMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.5 });
+        const beam = new THREE.Mesh(beamGeo, beamMat);
+        beam.position.set(p.x, beamH / 2 + 0.01, p.z);
+        markersGroup.add(beam);
+
+        const capGeo = new THREE.SphereGeometry(0.03, 16, 16);
+        const capMat = new THREE.MeshBasicMaterial({ color: col });
+        const cap = new THREE.Mesh(capGeo, capMat);
+        cap.position.set(p.x, beamH + 0.02, p.z);
+        cap.userData = { type: "energy", index: i, data: city };
+        markersGroup.add(cap);
+        sceneRef.current.clickables.push(cap);
+
+        const ringGeo = new THREE.RingGeometry(0.035, 0.05, 32);
+        const ringMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.3, side: THREE.DoubleSide });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.rotation.x = -Math.PI / 2;
+        ring.position.set(p.x, 0.015, p.z);
+        markersGroup.add(ring);
+      });
+    }
+  }, []);
+
+  // Rebuild when tab/data changes
+  useEffect(() => {
+    rebuildMarkers();
+  }, [tab, airStations, chargers, rebuildMarkers]);
+
+  // Init scene once
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
@@ -106,104 +238,45 @@ function HoloMap({ onSelect, selected, dataMode }) {
     renderer.setClearColor(0x020608, 1);
     mount.appendChild(renderer.domElement);
 
-    // ── GROUND GRID ──
+    // Ground grid
     const gridGroup = new THREE.Group();
     const gridMat = new THREE.LineBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.04 });
     for (let i = -5; i <= 5; i += 0.5) {
-      const pts1 = [new THREE.Vector3(i, -0.01, -5), new THREE.Vector3(i, -0.01, 5)];
-      const pts2 = [new THREE.Vector3(-5, -0.01, i), new THREE.Vector3(5, -0.01, i)];
-      gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts1), gridMat));
-      gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts2), gridMat));
+      gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(i, -0.01, -5), new THREE.Vector3(i, -0.01, 5)]), gridMat));
+      gridGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-5, -0.01, i), new THREE.Vector3(5, -0.01, i)]), gridMat));
     }
     scene.add(gridGroup);
 
-    // ── HUNGARY OUTLINE (3D) ──
+    // Hungary outline
     const mapGroup = new THREE.Group();
-
-    // Border line
-    const borderPts = HU_BORDER.map(([lat, lng]) => {
-      const p = project(lat, lng);
-      return new THREE.Vector3(p.x, 0.01, p.z);
-    });
+    const borderPts = HU_BORDER.map(([lat, lng]) => { const p = project(lat, lng); return new THREE.Vector3(p.x, 0.01, p.z); });
     const borderGeo = new THREE.BufferGeometry().setFromPoints(borderPts);
-    const borderLine = new THREE.Line(borderGeo, new THREE.LineBasicMaterial({
-      color: 0x00ffaa, transparent: true, opacity: 0.9
-    }));
-    mapGroup.add(borderLine);
-
-    // Glow border (thicker, more transparent)
-    const glowLine = new THREE.Line(borderGeo.clone(), new THREE.LineBasicMaterial({
-      color: 0x00ffaa, transparent: true, opacity: 0.15, linewidth: 3
-    }));
+    mapGroup.add(new THREE.Line(borderGeo, new THREE.LineBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.9 })));
+    const glowLine = new THREE.Line(borderGeo.clone(), new THREE.LineBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.15 }));
     glowLine.position.y = 0.005;
     mapGroup.add(glowLine);
 
-    // Fill shape
     const shape = new THREE.Shape();
     const projBorder = HU_BORDER.map(([lat, lng]) => project(lat, lng));
     shape.moveTo(projBorder[0].x, projBorder[0].z);
     projBorder.slice(1).forEach(p => shape.lineTo(p.x, p.z));
     shape.closePath();
-
     const fillGeo = new THREE.ShapeGeometry(shape);
     fillGeo.rotateX(-Math.PI / 2);
-    const fillMat = new THREE.MeshBasicMaterial({
-      color: 0x00ffaa, transparent: true, opacity: 0.04, side: THREE.DoubleSide
-    });
-    const fillMesh = new THREE.Mesh(fillGeo, fillMat);
+    const fillMesh = new THREE.Mesh(fillGeo, new THREE.MeshBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.04, side: THREE.DoubleSide }));
     fillMesh.position.y = 0.005;
     mapGroup.add(fillMesh);
-
-    // ── CITY MARKERS + BEAMS ──
-    const markers = [];
-    const beams = [];
-    const rings = [];
-
-    CITIES.forEach((city, i) => {
-      const p = project(city.lat, city.lng);
-      const col = new THREE.Color(aqiC(city.aqi));
-
-      // Data beam (height based on data)
-      const beamH = 0.15 + (city.sc / 100) * 0.6;
-      const beamGeo = new THREE.CylinderGeometry(0.012, 0.012, beamH, 8);
-      const beamMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.5 });
-      const beam = new THREE.Mesh(beamGeo, beamMat);
-      beam.position.set(p.x, beamH / 2 + 0.01, p.z);
-      mapGroup.add(beam);
-      beams.push(beam);
-
-      // Top cap (glowing sphere)
-      const capGeo = new THREE.SphereGeometry(0.03, 16, 16);
-      const capMat = new THREE.MeshBasicMaterial({ color: col });
-      const cap = new THREE.Mesh(capGeo, capMat);
-      cap.position.set(p.x, beamH + 0.02, p.z);
-      cap.userData = { index: i };
-      mapGroup.add(cap);
-      markers.push(cap);
-
-      // Base ring
-      const ringGeo = new THREE.RingGeometry(0.035, 0.05, 32);
-      const ringMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.3, side: THREE.DoubleSide });
-      const ring = new THREE.Mesh(ringGeo, ringMat);
-      ring.rotation.x = -Math.PI / 2;
-      ring.position.set(p.x, 0.015, p.z);
-      mapGroup.add(ring);
-      rings.push(ring);
-
-      // Pulse ring (animated in loop)
-      const pulseGeo = new THREE.RingGeometry(0.04, 0.045, 32);
-      const pulseMat = new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.15, side: THREE.DoubleSide });
-      const pulse = new THREE.Mesh(pulseGeo, pulseMat);
-      pulse.rotation.x = -Math.PI / 2;
-      pulse.position.set(p.x, 0.012, p.z);
-      pulse.userData = { baseScale: 1, phase: i * 0.5 };
-      mapGroup.add(pulse);
-      rings.push(pulse);
-    });
-
     scene.add(mapGroup);
 
-    // ── FLOATING PARTICLES ──
+    // Markers group (swapped on tab change)
+    const markersGroup = new THREE.Group();
+    scene.add(markersGroup);
+    sceneRef.current = { scene, markersGroup, camera, clickables: [], chargerPoints: null };
+
+    // Build initial markers
+    rebuildMarkers();
+
+    // Particles
     const pCount = 800;
     const pGeo = new THREE.BufferGeometry();
     const pPos = new Float32Array(pCount * 3);
@@ -215,14 +288,13 @@ function HoloMap({ onSelect, selected, dataMode }) {
       pVel.push({ vy: 0.001 + Math.random() * 0.003 });
     }
     pGeo.setAttribute("position", new THREE.BufferAttribute(pPos, 3));
-    const pMat = new THREE.PointsMaterial({
+    const particles = new THREE.Points(pGeo, new THREE.PointsMaterial({
       color: 0x00ffaa, size: 0.015, transparent: true, opacity: 0.4,
       blending: THREE.AdditiveBlending, sizeAttenuation: true
-    });
-    const particles = new THREE.Points(pGeo, pMat);
+    }));
     scene.add(particles);
 
-    // ── LIGHTING ──
+    // Lighting
     scene.add(new THREE.AmbientLight(0x222222, 0.5));
     const dl = new THREE.DirectionalLight(0x00ffaa, 0.4);
     dl.position.set(3, 5, 3);
@@ -231,38 +303,34 @@ function HoloMap({ onSelect, selected, dataMode }) {
     pl.position.set(0, 2, 0);
     scene.add(pl);
 
-    // ── INTERACTION ──
+    // Interaction
     const raycaster = new THREE.Raycaster();
+    raycaster.params.Points = { threshold: 0.05 };
     const pointer = new THREE.Vector2(-10, -10);
-    let targetRotY = 0, rotY = 0;
-    let targetRotX = 0.7, rotX = 0.7; // start tilted
+    let targetRotY = 0, rotY = 0, targetRotX = 0.7, rotX = 0.7;
     let targetZoom = 3.5, zoom = 3.5;
     let isDragging = false, dragX = 0, dragY = 0, dragRotY = 0, dragRotX = 0;
 
     const onMove = (e) => {
       const rect = mount.getBoundingClientRect();
-      pointer.x = ((e.clientX - rect.left) / W) * 2 - 1;
-      pointer.y = -((e.clientY - rect.top) / H) * 2 + 1;
+      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
       if (isDragging) {
         targetRotY = dragRotY + (e.clientX - dragX) * 0.008;
         targetRotX = dragRotX + (e.clientY - dragY) * 0.005;
         targetRotX = Math.max(0.2, Math.min(1.4, targetRotX));
       }
     };
-    const onDown = (e) => {
-      isDragging = true; dragX = e.clientX; dragY = e.clientY;
-      dragRotY = targetRotY; dragRotX = targetRotX;
-    };
+    const onDown = (e) => { isDragging = true; dragX = e.clientX; dragY = e.clientY; dragRotY = targetRotY; dragRotX = targetRotX; };
     const onUp = () => { isDragging = false; };
-    const onWheel = (e) => {
-      e.preventDefault();
-      targetZoom += e.deltaY * 0.004;
-      targetZoom = Math.max(1.8, Math.min(6, targetZoom));
-    };
+    const onWheel = (e) => { e.preventDefault(); targetZoom += e.deltaY * 0.004; targetZoom = Math.max(1.8, Math.min(6, targetZoom)); };
     const onClick = () => {
       raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(markers);
-      if (hits.length > 0) onSelect(CITIES[hits[0].object.userData.index]);
+      const hits = raycaster.intersectObjects(sceneRef.current.clickables);
+      if (hits.length > 0) {
+        const ud = hits[0].object.userData;
+        dataRef.current.onSelect({ ...ud.data, _type: ud.type });
+      }
     };
 
     mount.addEventListener("mousemove", onMove);
@@ -271,70 +339,57 @@ function HoloMap({ onSelect, selected, dataMode }) {
     mount.addEventListener("wheel", onWheel, { passive: false });
     mount.addEventListener("click", onClick);
 
-    // ── ANIMATE ──
+    // Animate
     let t = 0;
+    let animId;
     const animate = () => {
       t += 0.01;
-
-      // Smooth camera orbit
       if (!isDragging) targetRotY += 0.0001;
       rotY += (targetRotY - rotY) * 0.04;
       rotX += (targetRotX - rotX) * 0.04;
       zoom += (targetZoom - zoom) * 0.06;
-
       camera.position.x = Math.sin(rotY) * zoom;
       camera.position.z = Math.cos(rotY) * zoom * Math.cos(rotX - 0.5);
       camera.position.y = zoom * Math.sin(rotX - 0.2);
       camera.lookAt(0, 0.2, 0);
 
-      // Beam pulse
-      beams.forEach((b, i) => {
-        const s = 1 + Math.sin(t * 2 + i * 0.7) * 0.08;
-        b.scale.y = s;
-        b.material.opacity = 0.35 + Math.sin(t * 2 + i) * 0.15;
-      });
-
-      // Cap pulse
-      markers.forEach((m, i) => {
-        const s = 1 + Math.sin(t * 3 + i) * 0.25;
-        m.scale.setScalar(s);
-      });
-
-      // Pulse rings
-      rings.forEach(r => {
-        if (r.userData.phase !== undefined) {
-          const s = 1 + Math.sin(t * 1.5 + r.userData.phase) * 0.4;
-          r.scale.setScalar(s);
-          r.material.opacity = 0.15 * (1 - (s - 1) / 0.4);
+      // Animate markers in markersGroup
+      markersGroup.children.forEach((child, i) => {
+        if (child.isMesh && child.geometry?.type === "SphereGeometry" && child.visible) {
+          const s = 1 + Math.sin(t * 3 + i) * 0.2;
+          child.scale.setScalar(s);
+        }
+        if (child.isMesh && child.geometry?.type === "CylinderGeometry") {
+          child.material.opacity = 0.35 + Math.sin(t * 2 + i * 0.7) * 0.12;
         }
       });
 
-      // Particles float up
+      // EV point cloud pulse
+      const cp = sceneRef.current.chargerPoints;
+      if (cp) {
+        cp.cloud.material.opacity = 0.6 + Math.sin(t * 1.5) * 0.2;
+      }
+
+      // Particles
       const pos = particles.geometry.attributes.position.array;
       for (let i = 0; i < pCount; i++) {
         pos[i * 3 + 1] += pVel[i].vy;
-        if (pos[i * 3 + 1] > 3) {
-          pos[i * 3 + 1] = 0;
-          pos[i * 3] = (Math.random() - 0.5) * 8;
-          pos[i * 3 + 2] = (Math.random() - 0.5) * 8;
-        }
+        if (pos[i * 3 + 1] > 3) { pos[i * 3 + 1] = 0; pos[i * 3] = (Math.random() - 0.5) * 8; pos[i * 3 + 2] = (Math.random() - 0.5) * 8; }
       }
       particles.geometry.attributes.position.needsUpdate = true;
 
-      // Point light orbits
       pl.position.x = Math.sin(t * 0.5) * 2;
       pl.position.z = Math.cos(t * 0.5) * 2;
       pl.intensity = 0.4 + Math.sin(t) * 0.2;
 
-      // Hover cursor
       raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(markers);
+      const hits = raycaster.intersectObjects(sceneRef.current.clickables);
       mount.style.cursor = hits.length > 0 ? "pointer" : isDragging ? "grabbing" : "grab";
 
       renderer.render(scene, camera);
-      requestAnimationFrame(animate);
+      animId = requestAnimationFrame(animate);
     };
-    animate();
+    animId = requestAnimationFrame(animate);
 
     const onResize = () => {
       const w = mount.clientWidth, h = mount.clientHeight;
@@ -345,6 +400,7 @@ function HoloMap({ onSelect, selected, dataMode }) {
     window.addEventListener("resize", onResize);
 
     return () => {
+      cancelAnimationFrame(animId);
       mount.removeEventListener("mousemove", onMove);
       mount.removeEventListener("mousedown", onDown);
       window.removeEventListener("mouseup", onUp);
@@ -353,7 +409,7 @@ function HoloMap({ onSelect, selected, dataMode }) {
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
       renderer.dispose();
     };
-  }, []);
+  }, [rebuildMarkers]);
 
   return <div ref={mountRef} style={{ width: "100%", height: "100%", position: "absolute", inset: 0 }} />;
 }
@@ -375,13 +431,45 @@ function Num({ to, sfx = "", dec = 0 }) {
   return <>{dec ? v.toFixed(dec) : Math.round(v)}{sfx}</>;
 }
 
+const Glass = ({ children, style = {} }) => (
+  <div style={{ background: "rgba(2,6,8,.65)", backdropFilter: "blur(20px)", border: "1px solid rgba(255,255,255,.04)", borderRadius: 12, ...style }}>{children}</div>
+);
+
 /* ═══════════════════════════════════════════════════════════ */
 export default function ZoldRadarHolo() {
   const [selected, setSelected] = useState(null);
   const [ready, setReady] = useState(false);
   const [tab, setTab] = useState("air");
+  const [airStations, setAirStations] = useState([]);
+  const [chargers, setChargers] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [isDemo, setIsDemo] = useState(false);
 
   useEffect(() => { setTimeout(() => setReady(true), 400); }, []);
+
+  // Fetch live data
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([
+      fetch("/api/air").then(r => r.ok ? r.json() : Promise.reject(r)),
+      fetch("/api/chargers").then(r => r.ok ? r.json() : Promise.reject(r)),
+    ]).then(([airData, chargerData]) => {
+      setAirStations(airData.stations || []);
+      setChargers(chargerData.chargers || []);
+      setStats({
+        avgAqi: airData.avgAqi,
+        stationCount: airData.count,
+        totalChargers: chargerData.totalStations,
+        totalPoints: chargerData.totalPoints,
+      });
+      setIsDemo(false);
+    }).catch(err => {
+      console.warn("API fetch failed, using demo data:", err);
+      setIsDemo(true);
+      setStats({ avgAqi: 46, stationCount: 19, totalChargers: 847, totalPoints: 2847 });
+    }).finally(() => setLoading(false));
+  }, []);
 
   const d = selected;
   const font = "'Syne','Outfit',sans-serif";
@@ -393,15 +481,13 @@ export default function ZoldRadarHolo() {
       <style>{`
         @keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
         @keyframes slideIn{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:none}}
-        @keyframes glow{0%,100%{box-shadow:0 0 20px rgba(0,255,170,.2)}50%{box-shadow:0 0 40px rgba(0,255,170,.4)}}
-        @keyframes textGlow{0%,100%{text-shadow:0 0 20px rgba(0,255,170,.3)}50%{text-shadow:0 0 50px rgba(0,255,170,.6)}}
         @keyframes pulse{0%,100%{opacity:.3}50%{opacity:.9}}
+        @keyframes shimmer{0%{opacity:.15}50%{opacity:.4}100%{opacity:.15}}
         *{box-sizing:border-box;margin:0;padding:0}
         ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:rgba(0,255,170,.12);border-radius:3px}
       `}</style>
 
-      {/* 3D Scene */}
-      <HoloMap onSelect={setSelected} selected={selected} dataMode={tab} />
+      <HoloMap onSelect={setSelected} tab={tab} airStations={airStations} chargers={chargers} />
 
       {/* ─── TOP BAR ─── */}
       <div style={{
@@ -410,7 +496,6 @@ export default function ZoldRadarHolo() {
         background: "linear-gradient(180deg, rgba(2,6,8,.85) 0%, transparent 100%)",
         animation: ready ? "fadeUp .8s cubic-bezier(.16,1,.3,1) both" : "none",
       }}>
-        {/* Hero content - top left */}
         <div style={{ maxWidth: 420 }}>
           <div style={{ fontSize: 10, color: "#00ffaa", letterSpacing: ".2em", textTransform: "uppercase", fontWeight: 600, marginBottom: 6 }}>
             Magyarország · Környezeti Intelligencia
@@ -419,15 +504,14 @@ export default function ZoldRadarHolo() {
             A zöld átmenet <span style={{ color: "#00ffaa" }}>élő hologramja</span>
           </h1>
           <p style={{ fontSize: 12, color: "rgba(255,255,255,.3)", marginTop: 6, lineHeight: 1.6, fontWeight: 300 }}>
-            Forgasd a 3D térképet · Görgess a zoomhoz · Kattints a városokra
+            Forgasd a 3D térképet · Görgess a zoomhoz · Kattints a {tab === "air" ? "mérőállomásokra" : tab === "ev" ? "töltőkre" : "városokra"}
           </p>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          {/* Tabs */}
           <div style={{ display: "flex", gap: 0, background: "rgba(255,255,255,.02)", borderRadius: 10, padding: 3, border: "1px solid rgba(255,255,255,.03)" }}>
             {[{ id: "air", l: "Levegő", e: "🌬" }, { id: "energy", l: "Energia", e: "☀️" }, { id: "ev", l: "Töltők", e: "⚡" }].map(t => (
-              <button key={t.id} onClick={() => setTab(t.id)} style={{
+              <button key={t.id} onClick={() => { setTab(t.id); setSelected(null); }} style={{
                 padding: "6px 16px", border: "none", borderRadius: 8, cursor: "pointer", fontFamily: font,
                 fontSize: 11, fontWeight: 500, display: "flex", alignItems: "center", gap: 5,
                 background: tab === t.id ? "rgba(0,255,170,.08)" : "transparent",
@@ -439,30 +523,31 @@ export default function ZoldRadarHolo() {
             ))}
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div style={{ width: 5, height: 5, borderRadius: "50%", background: "#00ffaa", animation: "pulse 2s infinite", boxShadow: "0 0 10px rgba(0,255,170,.6)" }} />
-            <span style={{ fontFamily: mono, fontSize: 10, color: "rgba(255,255,255,.2)" }}>LIVE</span>
+            <div style={{ width: 5, height: 5, borderRadius: "50%", background: isDemo ? "#fb923c" : "#00ffaa", animation: "pulse 2s infinite", boxShadow: `0 0 10px ${isDemo ? "rgba(251,146,40,.6)" : "rgba(0,255,170,.6)"}` }} />
+            <span style={{ fontFamily: mono, fontSize: 10, color: "rgba(255,255,255,.2)" }}>{loading ? "..." : isDemo ? "DEMO" : "LIVE"}</span>
           </div>
         </div>
       </div>
 
-      {/* ─── BOTTOM LEFT: STATS ONLY ─── */}
+      {/* ─── BOTTOM LEFT: STATS ─── */}
       <div style={{
         position: "absolute", bottom: 28, left: 28, zIndex: 10,
         animation: ready ? "fadeUp 1s cubic-bezier(.16,1,.3,1) .3s both" : "none",
       }}>
         <div style={{ display: "flex", gap: 24 }}>
           {[
-            { l: "AQI Átlag", v: "46", c: "#facc15" },
+            { l: "AQI Átlag", v: loading ? "---" : String(stats?.avgAqi ?? "46"), c: "#facc15" },
             { l: "Napenergia", v: "3.9 GW", c: "#00ffaa" },
-            { l: "EV Töltők", v: "2,847", c: "#60a5fa" },
+            { l: "EV Töltők", v: loading ? "---" : (stats?.totalPoints ?? 2847).toLocaleString("hu"), c: "#60a5fa" },
             { l: "CO₂/Fő", v: "4.8 t", c: "#fb923c" },
           ].map((s, i) => (
             <div key={i}>
               <div style={{ fontSize: 8, color: "rgba(255,255,255,.22)", textTransform: "uppercase", letterSpacing: ".12em", fontWeight: 500 }}>{s.l}</div>
-              <div style={{ fontSize: 24, fontWeight: 800, color: s.c, fontFamily: mono, letterSpacing: "-.04em", marginTop: 3, textShadow: `0 0 20px ${s.c}35` }}>{s.v}</div>
+              <div style={{ fontSize: 24, fontWeight: 800, color: s.c, fontFamily: mono, letterSpacing: "-.04em", marginTop: 3, textShadow: `0 0 20px ${s.c}35`, animation: loading ? "shimmer 1.5s infinite" : "none" }}>{s.v}</div>
             </div>
           ))}
         </div>
+        {isDemo && <div style={{ fontSize: 8, color: "rgba(251,146,40,.5)", marginTop: 6, fontStyle: "italic" }}>(demo adat)</div>}
       </div>
 
       {/* ─── RIGHT: DETAIL PANEL ─── */}
@@ -478,74 +563,124 @@ export default function ZoldRadarHolo() {
             fontSize: 13, display: "grid", placeItems: "center", backdropFilter: "blur(16px)",
           }}>✕</button>
 
-          {/* Header */}
-          <div style={{
-            background: "rgba(2,6,8,.7)", backdropFilter: "blur(24px)",
-            border: "1px solid rgba(0,255,170,.08)", borderRadius: 14, padding: 20,
-          }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-              <div style={{
-                width: 60, height: 60, borderRadius: 12,
-                background: `conic-gradient(${scC(d.sc)} ${d.sc}%, rgba(255,255,255,.03) 0)`,
-                display: "grid", placeItems: "center", boxShadow: `0 0 20px ${scC(d.sc)}25`,
-              }}>
-                <div style={{ width: 48, height: 48, borderRadius: 9, background: "rgba(2,6,8,.9)", display: "grid", placeItems: "center" }}>
-                  <span style={{ fontSize: 18, fontWeight: 800, color: scC(d.sc), fontFamily: mono }}>{d.sc}</span>
+          {/* Air station panel */}
+          {d._type === "air" && (
+            <>
+              <Glass style={{ padding: 20 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <div style={{
+                    width: 60, height: 60, borderRadius: 12,
+                    background: aqiColor(d.aqi), display: "grid", placeItems: "center",
+                    boxShadow: `0 0 24px ${aqiColor(d.aqi)}40`,
+                  }}>
+                    <span style={{ fontSize: 22, fontWeight: 900, color: "#000", fontFamily: mono }}>{d.aqi}</span>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 8, color: "rgba(255,255,255,.25)", letterSpacing: ".1em", textTransform: "uppercase", fontWeight: 600 }}>AQI</div>
+                    <h2 style={{ fontSize: 16, fontWeight: 700, color: "#f0fdf4", letterSpacing: "-.02em", lineHeight: 1.2, marginTop: 2 }}>{d.name}</h2>
+                    <div style={{
+                      display: "inline-block", marginTop: 6, fontSize: 7, fontWeight: 700,
+                      color: aqiColor(d.aqi), background: `${aqiColor(d.aqi)}15`, padding: "2px 8px", borderRadius: 5,
+                      letterSpacing: ".1em", textTransform: "uppercase",
+                    }}>{aqiLabel(d.aqi)}</div>
+                  </div>
                 </div>
-              </div>
-              <div>
-                <h2 style={{ fontSize: 22, fontWeight: 800, color: "#f0fdf4", letterSpacing: "-.03em", lineHeight: 1 }}>{d.county}</h2>
-                <div style={{ fontSize: 11, color: "rgba(255,255,255,.3)", marginTop: 3 }}>{d.name}</div>
-                <div style={{
-                  display: "inline-block", marginTop: 6, fontSize: 7, fontWeight: 700,
-                  color: scC(d.sc), background: `${scC(d.sc)}12`, padding: "2px 8px", borderRadius: 5,
-                  letterSpacing: ".1em", textTransform: "uppercase",
-                }}>{d.sc >= 70 ? "ZÖLD ÉLLOVAS" : d.sc >= 55 ? "FEJLŐDŐ" : "FEJLESZTENDŐ"}</div>
-              </div>
-            </div>
-          </div>
-
-          {/* Metrics */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-            {[
-              { l: "LEVEGŐ", v: d.aqi, u: d.aqi <= 30 ? "Kiváló" : d.aqi <= 45 ? "Jó" : d.aqi <= 55 ? "Mérsékelt" : "Gyenge", c: aqiC(d.aqi) },
-              { l: "EV TÖLTŐK", v: d.ev, u: "pont", c: "#60a5fa" },
-              { l: "NAPENERGIA", v: d.sol, u: "MW", c: "#facc15" },
-              { l: "CO₂/FŐ", v: d.co2, u: "t/év", c: d.co2 > 5 ? "#fb923c" : "#00ffaa", dec: 1 },
-            ].map((m, i) => (
-              <div key={i} style={{
-                background: "rgba(2,6,8,.6)", backdropFilter: "blur(20px)",
-                border: "1px solid rgba(255,255,255,.035)", borderRadius: 12, padding: "12px 14px",
-                position: "relative", overflow: "hidden",
-              }}>
-                <div style={{ position: "absolute", top: -15, right: -15, width: 50, height: 50, borderRadius: "50%", background: `${m.c}05`, filter: "blur(18px)" }} />
-                <div style={{ fontSize: 7.5, color: "rgba(255,255,255,.22)", letterSpacing: ".12em", fontWeight: 600 }}>{m.l}</div>
-                <div style={{ fontSize: 26, fontWeight: 800, fontFamily: mono, color: m.c, letterSpacing: "-.04em", lineHeight: 1, marginTop: 6, textShadow: `0 0 18px ${m.c}30` }}>
-                  <Num to={m.v} dec={m.dec || 0} />
+              </Glass>
+              <Glass style={{ padding: 16 }}>
+                <div style={{ fontSize: 8, color: "rgba(255,255,255,.25)", letterSpacing: ".12em", fontWeight: 600, marginBottom: 10, textTransform: "uppercase" }}>Részletek</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 8, color: "rgba(255,255,255,.2)" }}>Koordináták</div>
+                    <div style={{ fontSize: 11, fontFamily: mono, color: "rgba(255,255,255,.5)", marginTop: 2 }}>{d.lat?.toFixed(2)}°N, {d.lng?.toFixed(2)}°E</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 8, color: "rgba(255,255,255,.2)" }}>Minőség</div>
+                    <div style={{ fontSize: 11, color: aqiColor(d.aqi), fontWeight: 600, marginTop: 2 }}>{aqiLabel(d.aqi)}</div>
+                  </div>
                 </div>
-                <div style={{ fontSize: 8.5, color: "rgba(255,255,255,.18)", marginTop: 3 }}>{m.u}</div>
-              </div>
-            ))}
-          </div>
+              </Glass>
+            </>
+          )}
 
-          {/* AI */}
-          <div style={{
-            background: "rgba(2,6,8,.6)", backdropFilter: "blur(20px)",
-            border: "1px solid rgba(0,255,170,.06)", borderRadius: 12, padding: 16,
-          }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10 }}>
-              <div style={{
-                width: 20, height: 20, borderRadius: 6,
-                background: "linear-gradient(135deg, #00ffaa, #059669)",
-                display: "grid", placeItems: "center",
-                boxShadow: "0 0 12px rgba(0,255,170,.4)",
-              }}><span style={{ fontSize: 9, color: "#000", fontWeight: 900 }}>✦</span></div>
-              <span style={{ fontSize: 8, color: "#00ffaa", fontWeight: 600, letterSpacing: ".15em", textTransform: "uppercase" }}>AI Elemzés</span>
-            </div>
-            <p style={{ fontSize: 12.5, lineHeight: 1.8, color: "rgba(255,255,255,.4)", fontWeight: 300 }}>
-              {d.county} zöld indexe {d.sc}/100. Levegő: AQI {d.aqi}. Telepített napenergia: {d.sol} MW. EV hálózat: {d.ev} töltőpont. CO₂: {d.co2} t/fő/év.
-            </p>
-          </div>
+          {/* EV charger panel */}
+          {d._type === "ev" && (
+            <>
+              <Glass style={{ padding: 20 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <div style={{
+                    width: 60, height: 60, borderRadius: 12,
+                    background: "rgba(96,165,250,.15)", border: "1px solid rgba(96,165,250,.2)",
+                    display: "grid", placeItems: "center",
+                  }}>
+                    <span style={{ fontSize: 26 }}>⚡</span>
+                  </div>
+                  <div>
+                    <h2 style={{ fontSize: 16, fontWeight: 700, color: "#f0fdf4", letterSpacing: "-.02em", lineHeight: 1.2 }}>{d.name}</h2>
+                    {d.town && <div style={{ fontSize: 11, color: "rgba(255,255,255,.3)", marginTop: 3 }}>{d.town}</div>}
+                  </div>
+                </div>
+              </Glass>
+              <Glass style={{ padding: 16 }}>
+                <div style={{ fontSize: 8, color: "rgba(255,255,255,.25)", letterSpacing: ".12em", fontWeight: 600, marginBottom: 10, textTransform: "uppercase" }}>Töltő adatok</div>
+                {[
+                  { l: "Operátor", v: d.operator || "Ismeretlen" },
+                  { l: "Csatlakozók", v: `${d.numPoints || 1} db` },
+                  { l: "Teljesítmény", v: d.powerKW ? `${d.powerKW} kW` : "N/A", c: evColor(d.powerKW || 0) },
+                  { l: "Státusz", v: "Működik", c: "#00ffaa" },
+                ].map((r, i) => (
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: i < 3 ? "1px solid rgba(255,255,255,.03)" : "none" }}>
+                    <span style={{ fontSize: 10, color: "rgba(255,255,255,.3)" }}>{r.l}</span>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: r.c || "rgba(255,255,255,.6)", fontFamily: mono }}>{r.v}</span>
+                  </div>
+                ))}
+              </Glass>
+            </>
+          )}
+
+          {/* Energy panel (existing style) */}
+          {d._type === "energy" && (
+            <>
+              <Glass style={{ padding: 20 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                  <div style={{
+                    width: 60, height: 60, borderRadius: 12,
+                    background: `conic-gradient(${scC(d.sc)} ${d.sc}%, rgba(255,255,255,.03) 0)`,
+                    display: "grid", placeItems: "center", boxShadow: `0 0 20px ${scC(d.sc)}25`,
+                  }}>
+                    <div style={{ width: 48, height: 48, borderRadius: 9, background: "rgba(2,6,8,.9)", display: "grid", placeItems: "center" }}>
+                      <span style={{ fontSize: 18, fontWeight: 800, color: scC(d.sc), fontFamily: mono }}>{d.sc}</span>
+                    </div>
+                  </div>
+                  <div>
+                    <h2 style={{ fontSize: 22, fontWeight: 800, color: "#f0fdf4", letterSpacing: "-.03em", lineHeight: 1 }}>{d.county}</h2>
+                    <div style={{ fontSize: 11, color: "rgba(255,255,255,.3)", marginTop: 3 }}>{d.name}</div>
+                    <div style={{
+                      display: "inline-block", marginTop: 6, fontSize: 7, fontWeight: 700,
+                      color: scC(d.sc), background: `${scC(d.sc)}12`, padding: "2px 8px", borderRadius: 5,
+                      letterSpacing: ".1em", textTransform: "uppercase",
+                    }}>{d.sc >= 70 ? "ZÖLD ÉLLOVAS" : d.sc >= 55 ? "FEJLŐDŐ" : "FEJLESZTENDŐ"}</div>
+                  </div>
+                </div>
+              </Glass>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                {[
+                  { l: "NAPENERGIA", v: d.sol, u: "MW", c: "#facc15" },
+                  { l: "EV TÖLTŐK", v: d.ev, u: "pont", c: "#60a5fa" },
+                  { l: "CO₂/FŐ", v: d.co2, u: "t/év", c: d.co2 > 5 ? "#fb923c" : "#00ffaa", dec: 1 },
+                  { l: "LEVEGŐ", v: d.aqi, u: aqiLabel(d.aqi), c: aqiColor(d.aqi) },
+                ].map((m, i) => (
+                  <Glass key={i} style={{ padding: "12px 14px", position: "relative", overflow: "hidden" }}>
+                    <div style={{ position: "absolute", top: -15, right: -15, width: 50, height: 50, borderRadius: "50%", background: `${m.c}05`, filter: "blur(18px)" }} />
+                    <div style={{ fontSize: 7.5, color: "rgba(255,255,255,.22)", letterSpacing: ".12em", fontWeight: 600 }}>{m.l}</div>
+                    <div style={{ fontSize: 26, fontWeight: 800, fontFamily: mono, color: m.c, letterSpacing: "-.04em", lineHeight: 1, marginTop: 6, textShadow: `0 0 18px ${m.c}30` }}>
+                      <Num to={m.v} dec={m.dec || 0} />
+                    </div>
+                    <div style={{ fontSize: 8.5, color: "rgba(255,255,255,.18)", marginTop: 3 }}>{m.u}</div>
+                  </Glass>
+                ))}
+              </div>
+            </>
+          )}
         </div>
       )}
 
